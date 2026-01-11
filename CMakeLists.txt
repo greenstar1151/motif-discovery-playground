@@ -59,6 +59,20 @@ if(BUILD_TESTS)
 endif()
 
 # -----------------------------------------------------------------------------
+# Benchmark Executable
+# -----------------------------------------------------------------------------
+add_executable(motif_benchmark
+    src/benchmark.cpp
+)
+
+target_link_libraries(motif_benchmark PRIVATE motif_core)
+
+# Enable optimizations for benchmark
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    target_compile_options(motif_benchmark PRIVATE -O3 -march=native)
+endif()
+
+# -----------------------------------------------------------------------------
 # Installation
 # -----------------------------------------------------------------------------
 install(TARGETS motif_discovery DESTINATION bin)
