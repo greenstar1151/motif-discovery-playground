@@ -38,7 +38,36 @@ cmake -B build && cmake --build build
 
 # Run unit tests
 ./build/motif_test
+
+# Run benchmark (large-scale preset)
+./build/motif_benchmark --large
 ```
+
+## Benchmarking
+
+The benchmark executable generates large synthetic datasets and times each
+core operation (k-mer counting, enrichment, PWM build/scan, masking). Use
+`--large` for a seconds-to-tens-of-seconds run, or override sizes with
+`--n`, `--l`, `--k`.
+
+```bash
+# Few seconds
+./build/motif_benchmark --n 20000 --l 200 --k 8 --runs 1
+
+# Tens of seconds (heavier)
+./build/motif_benchmark --large
+
+# Single-size focused run
+./build/motif_benchmark --n 50000 --l 300 --k 8 --runs 1
+```
+
+Key options:
+- `--n`: sequences per set (positive/negative)
+- `--l`: sequence length
+- `--k`: k-mer length
+- `--runs`: number of runs per configuration
+- `--large`: large-scale preset
+- `--quick`: fast sanity-check preset
 
 ## Project Structure
 

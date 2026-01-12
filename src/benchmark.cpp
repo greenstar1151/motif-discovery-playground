@@ -13,6 +13,8 @@
 #include <vector>
 #include <numeric>
 #include <algorithm>
+#include <cstdlib>
+#include <string>
 
 using namespace motif;
 using namespace std::chrono;
@@ -438,7 +440,7 @@ void benchmark_full_pipeline(const BenchmarkConfig& config) {
             if (best_score < threshold) break;
             
             // Step 4: Build PWM
-            auto pwm = build_pwm_from_seed(best_seed, current_pos);
+            (void)build_pwm_from_seed(best_seed, current_pos);
             
             // Step 5: Mask and continue
             current_pos = mask_pattern(current_pos, best_seed);
@@ -567,17 +569,148 @@ int main(int argc, char* argv[]) {
     
     BenchmarkConfig config;
     
-    // Parse command line for quick mode
+    auto print_usage = [&]() {
+        std::cout
+            << "\nUsage: motif_benchmark [options]\n\n"
+            << "Options:\n"
+            << "  -q, --quick         Use small data sizes for fast checks\n"
+            << "  --large             Use large data sizes (seconds to tens of seconds)\n"
+            << "  --n <int>            Override sequences per set\n"
+            << "  --l <int>            Override sequence length\n"
+            << "  --k <int>            Override k-mer length\n"
+            << "  --runs <int>         Number of runs per configuration\n"
+            << "  --motif <string>     Motif to inject (default TATATA)\n"
+            << "  --rate <float>       Injection rate in positive set (0..1)\n"
+            << "  --seed <int>         RNG seed\n"
+            << "  -h, --help           Show this help\n";
+    };
+    
+    // Parse command line
     bool quick_mode = false;
+    bool large_mode = false;
+    bool override_n = false;
+    bool override_l = false;
+    bool override_k = false;
+    bool override_runs = false;
+    
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--quick" || std::string(argv[i]) == "-q") {
+        const std::string arg = argv[i];
+        auto require_value = [&](const char* name) -> std::string {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for " << name << "\n";
+                print_usage();
+                std::exit(2);
+            }
+            return argv[++i];
+        };
+        
+        auto parse_size_t = [&](const std::string& s, const char* name) -> size_t {
+            try {
+                size_t pos = 0;
+                const auto v = std::stoull(s, &pos, 10);
+                if (pos != s.size()) throw std::invalid_argument("bad");
+                return static_cast<size_t>(v);
+            } catch (...) {
+                std::cerr << "Invalid value for " << name << "\n";
+                print_usage();
+                std::exit(2);
+            }
+        };
+        
+        auto parse_int = [&](const std::string& s, const char* name) -> int {
+            try {
+                size_t pos = 0;
+                const int v = std::stoi(s, &pos, 10);
+                if (pos != s.size()) throw std::invalid_argument("bad");
+                return v;
+            } catch (...) {
+                std::cerr << "Invalid value for " << name << "\n";
+                print_usage();
+                std::exit(2);
+            }
+        };
+        
+        auto parse_double = [&](const std::string& s, const char* name) -> double {
+            try {
+                size_t pos = 0;
+                const double v = std::stod(s, &pos);
+                if (pos != s.size()) throw std::invalid_argument("bad");
+                return v;
+            } catch (...) {
+                std::cerr << "Invalid value for " << name << "\n";
+                print_usage();
+                std::exit(2);
+            }
+        };
+        
+        if (arg == "--quick" || arg == "-q") {
             quick_mode = true;
+        } else if (arg == "--large") {
+            large_mode = true;
+        } else if (arg == "--n") {
+            const auto v = parse_size_t(require_value("--n"), "--n");
+            config.num_sequences = {v};
+            override_n = true;
+        } else if (arg == "--l") {
+            const auto v = parse_size_t(require_value("--l"), "--l");
+            config.seq_lengths = {v};
+            override_l = true;
+        } else if (arg == "--k") {
+            const auto v = parse_size_t(require_value("--k"), "--k");
+            config.kmer_lengths = {v};
+            override_k = true;
+        } else if (arg == "--runs") {
+            const auto v = parse_int(require_value("--runs"), "--runs");
+            if (v <= 0) {
+                std::cerr << "--runs must be > 0\n";
+                std::exit(2);
+            }
+            config.num_runs = v;
+            override_runs = true;
+        } else if (arg == "--motif") {
+            config.target_motif = require_value("--motif");
+        } else if (arg == "--rate") {
+            const double v = parse_double(require_value("--rate"), "--rate");
+            if (v < 0.0 || v > 1.0) {
+                std::cerr << "--rate must be between 0 and 1\n";
+                std::exit(2);
+            }
+            config.injection_rate = v;
+        } else if (arg == "--seed") {
+            const int v = parse_int(require_value("--seed"), "--seed");
+            if (v < 0) {
+                std::cerr << "--seed must be >= 0\n";
+                std::exit(2);
+            }
+            config.seed = static_cast<unsigned int>(v);
+        } else if (arg == "-h" || arg == "--help") {
+            print_usage();
+            return 0;
+        } else {
+            std::cerr << "Unknown argument: " << arg << "\n";
+            print_usage();
+            return 2;
         }
+    }
+    
+    if (large_mode) {
+        std::cout << "\n[Large Mode: Using larger data sizes]\n";
+        config.num_sequences = {20000, 50000, 100000};
+        config.seq_lengths = {200, 500};
+        config.kmer_lengths = {6, 8};
+        config.num_runs = 1;
     }
     
     if (quick_mode) {
         std::cout << "\n[Quick Mode: Using smaller data sizes]\n";
         config.num_sequences = {1000, 5000};
+        config.seq_lengths = {50, 100};
+        config.kmer_lengths = {6};
+        config.num_runs = 1;
+    }
+    
+    // If user overrides any size, keep other defaults unless explicitly overridden.
+    if ((override_n || override_l || override_k) && !override_runs) {
         config.num_runs = 1;
     }
     
