@@ -11,6 +11,7 @@ This library implements the core computational primitives shared by motif discov
 - Modular, independently testable operations
 - Clean abstractions suitable for hardware mapping
 - Synthetic data generation for validation
+- Benchmark support using both synthetic and real DNA data
 
 ## Core Operations
 
@@ -45,34 +46,47 @@ cmake -B build && cmake --build build
 
 ## Benchmarking
 
-The benchmark executable generates large synthetic datasets and times each
-core operation (k-mer counting, enrichment, PWM build/scan, masking). Use
-`--large` for a seconds-to-tens-of-seconds run, or override sizes with
-`--n`, `--l`, `--k`.
+The benchmark executable supports both synthetic and real DNA data.
+
+### Synthetic Data (default)
 
 ```bash
-# Few seconds
-./build/motif_benchmark --n 20000 --l 200 --k 8 --runs 1
+# Quick sanity check
+./build/motif_benchmark --quick
 
-# Tens of seconds (heavier)
+# Large-scale synthetic benchmark
 ./build/motif_benchmark --large
 
-# Single-size focused run
+# Custom configuration
 ./build/motif_benchmark --n 50000 --l 300 --k 8 --runs 1
 ```
 
+### Real DNA Data
+
+```bash
+# Run with real data (DNA1, DNA2, DNA3 datasets)
+./build/motif_benchmark --real
+
+# Run with real data for specific k-mer lengths
+./build/motif_benchmark --real --k 6
+./build/motif_benchmark --real --k 8
+
+# Specify custom data files
+./build/motif_benchmark --real --baseline data/upstream5000.fa --sites data/MA0007.2.sites
+```
+
 Key options:
-- `--n`: sequences per set (positive/negative)
-- `--l`: sequence length
-- `--k`: k-mer length
+- `--quick`: fast sanity-check with small synthetic data
+- `--large`: large-scale synthetic benchmark
+- `--real`: use real DNA data
+- `--baseline <file>`: baseline FASTA file (default: data/upstream5000.fa)
+- `--sites <file>`: binding sites file (default: data/MA0007.2.sites)
+- `--n`, `--l`, `--k`: override data dimensions
 - `--runs`: number of runs per configuration
-- `--large`: large-scale preset
-- `--quick`: fast sanity-check preset
 
 ## Project Structure
 
 ```
-cpp/
 ├── CMakeLists.txt
 ├── include/
 │   ├── motif.hpp                 # Main header
@@ -83,10 +97,15 @@ cpp/
 │       ├── pwm_construction.hpp
 │       ├── pwm_scoring.hpp
 │       ├── sequence_masking.hpp
-│       └── data_generator.hpp
+│       ├── data_generator.hpp    # Synthetic data generation
+│       └── fasta_reader.hpp      # FASTA/.sites file I/O + injection
 ├── src/
 │   ├── main.cpp                  # Demo program
+│   ├── benchmark.cpp             # Performance benchmark
 │   └── *.cpp                     # Operation implementations
+├── data/                         # Real DNA data files
+│   ├── upstream5000.fa           # RefSeq upstream sequences
+│   └── MA0007.2.sites            # JASPAR binding sites
 └── tests/
     └── test_main.cpp
 ```
@@ -139,3 +158,56 @@ using KmerCounts = std::map<std::string, int>;
 
 - Bailey, T.L. (2021). "STREME: accurate and versatile sequence motif discovery." *Bioinformatics*, 37(18), 2834-2840. [DOI](https://doi.org/10.1093/bioinformatics/btab203)
 - [MEME Suite Documentation](https://meme-suite.org/meme/doc/streme.html)
+
+## Using Real DNA Data
+
+This library supports loading real DNA sequences and binding sites for realistic benchmarking.
+
+### Quick Start with Real Data
+
+```cpp
+#include "motif.hpp"
+using namespace motif;
+
+// One-liner: generate test data
+auto [primary, control] = generate_real_test_data(
+    "data/upstream5000.fa",   // Baseline sequences
+    "data/MA0007.2.sites",    // Real binding sites
+    32768,                     // Number of sequences
+    1000                       // Segment length
+);
+
+// Run motif discovery pipeline
+auto pos_counts = count_kmers(primary, 6);
+auto neg_counts = count_kmers(control, 6);
+// ...
+```
+
+### Step-by-Step Loading
+
+```cpp
+// Load baseline sequences from FASTA file
+auto baseline = read_fasta("data/upstream5000.fa");
+std::cout << "Loaded " << baseline.sequences.size() << " sequences\n";
+
+// Chop 5000bp sequences into 1000bp segments
+auto chopped = chop_sequences(baseline.sequences, 1000);
+
+// Load real binding sites (JASPAR .sites format = FASTA)
+auto sites = read_fasta("data/MA0007.2.sites");
+std::cout << "Loaded " << sites.sequences.size() << " binding sites\n";
+
+// Sample sequences for primary and control sets
+auto primary_baseline = sample_sequences(chopped, 32768, /*seed=*/42);
+auto sampled_sites = sample_sequences(sites.sequences, 32768, /*seed=*/43);
+
+// Inject real binding sites into baseline (one per sequence)
+auto primary = inject_binding_sites(primary_baseline, sampled_sites);
+
+// Control set: pure baseline without motifs
+auto control = sample_sequences(chopped, 32768, /*seed=*/1000);
+
+// Check base composition (real DNA is not uniform!)
+auto comp = compute_base_composition(primary);
+std::cout << "GC content: " << (comp.gc_content() * 100) << "%\n";
+```

@@ -1,6 +1,9 @@
 # Project Builds
 /build/
 
+# Data Files
+/data/
+
 # Prerequisites
 *.d
 

@@ -104,6 +104,12 @@ struct BenchmarkConfig {
     double injection_rate = 0.5;
     int num_runs = 3;  // Runs per configuration for averaging
     unsigned int seed = 42;
+    
+    // Real data mode
+    bool use_real_data = false;
+    std::string baseline_file = "data/upstream5000.fa";
+    std::string sites_file = "data/MA0007.2.sites";
+    size_t segment_length = 1000;
 };
 
 // =============================================================================
@@ -514,6 +520,150 @@ void benchmark_scalability(const BenchmarkConfig& config) {
 }
 
 // =============================================================================
+// Real Data Benchmark
+// =============================================================================
+
+void benchmark_real_data(const BenchmarkConfig& config) {
+    print_header("Benchmark: Real DNA Data");
+    
+    std::cout << std::endl;
+    std::cout << "Loading real data files..." << std::endl;
+    std::cout << "  Baseline: " << config.baseline_file << std::endl;
+    std::cout << "  Sites:    " << config.sites_file << std::endl;
+    std::cout << std::endl;
+    
+    Timer timer, total_timer;
+    total_timer.start();
+    
+    // Load baseline sequences
+    timer.start();
+    FastaData baseline_data;
+    try {
+        baseline_data = read_fasta(config.baseline_file);
+    } catch (const std::exception& e) {
+        std::cerr << "Error loading baseline file: " << e.what() << std::endl;
+        std::cerr << "Make sure data files exist in data/ directory" << std::endl;
+        return;
+    }
+    timer.stop();
+    std::cout << "  Loaded " << baseline_data.sequences.size() << " baseline sequences in "
+              << std::fixed << std::setprecision(1) << timer.elapsed_ms() << " ms" << std::endl;
+    
+    // Chop into segments
+    timer.start();
+    auto chopped = chop_sequences(baseline_data.sequences, config.segment_length);
+    timer.stop();
+    std::cout << "  Chopped into " << chopped.size() << " x " << config.segment_length 
+              << "bp segments in " << std::fixed << std::setprecision(1) << timer.elapsed_ms() << " ms" << std::endl;
+    
+    // Load binding sites
+    timer.start();
+    FastaData sites_data;
+    try {
+        sites_data = read_fasta(config.sites_file);
+    } catch (const std::exception& e) {
+        std::cerr << "Error loading sites file: " << e.what() << std::endl;
+        return;
+    }
+    timer.stop();
+    std::cout << "  Loaded " << sites_data.sequences.size() << " binding sites in "
+              << std::fixed << std::setprecision(1) << timer.elapsed_ms() << " ms" << std::endl;
+    
+    // Compute base composition
+    auto comp = compute_base_composition(chopped);
+    std::cout << "  GC content: " << std::fixed << std::setprecision(1) 
+              << (comp.gc_content() * 100) << "%" << std::endl;
+    std::cout << std::endl;
+    
+    // Dataset configurations (from Morbius, doi: 10.1109/e-Science62913.2024.10678700)
+    std::vector<std::tuple<std::string, size_t, size_t>> datasets = {
+        {"DNA1", 32768, 1024},
+        {"DNA2", 65536, 2048},
+        {"DNA3", 131072, 4096},
+    };
+    
+    std::cout << std::setw(10) << "Dataset"
+              << std::setw(6) << "K"
+              << std::setw(12) << "Sequences"
+              << std::setw(10) << "Sites"
+              << std::setw(12) << "Size (MB)"
+              << std::setw(15) << "K-mer (ms)"
+              << std::setw(15) << "Enrich (ms)"
+              << std::setw(15) << "Total (ms)"
+              << std::setw(15) << "Best Seed"
+              << std::endl;
+    print_separator('-');
+    
+    for (const auto& [name, num_seq, num_sites] : datasets) {
+        if (chopped.size() < num_seq) {
+            std::cout << std::setw(10) << name << "  (skipped - not enough baseline sequences)" << std::endl;
+            continue;
+        }
+        if (sites_data.sequences.size() < num_sites) {
+            std::cout << std::setw(10) << name << "  (skipped - not enough binding sites)" << std::endl;
+            continue;
+        }
+        
+        // Sample baseline and sites
+        auto primary_baseline = sample_sequences(chopped, num_seq, config.seed);
+        auto sampled_sites = sample_sequences(sites_data.sequences, num_sites, config.seed + 1);
+        
+        // Inject binding sites
+        timer.start();
+        auto primary = inject_binding_sites(primary_baseline, sampled_sites, config.seed + 2);
+        timer.stop();
+        double inject_ms = timer.elapsed_ms();
+        
+        // Control set (different sample, no injection)
+        auto control = sample_sequences(chopped, num_seq, config.seed + 1000);
+        
+        double size_mb = (num_seq * config.segment_length * 2) / (1024.0 * 1024.0);
+        
+        const std::vector<size_t> ks = config.kmer_lengths.empty()
+            ? std::vector<size_t>{6}
+            : config.kmer_lengths;
+
+        for (size_t k : ks) {
+            // Benchmark k-mer counting
+            timer.start();
+            auto pos_counts = count_kmers(primary, k);
+            auto neg_counts = count_kmers(control, k);
+            timer.stop();
+            double kmer_ms = timer.elapsed_ms();
+
+            // Benchmark enrichment scoring
+            timer.start();
+            auto scores = calculate_enrichment_scores(
+                pos_counts, neg_counts,
+                static_cast<int>(num_seq),
+                static_cast<int>(num_seq)
+            );
+            auto [best_seed, best_score] = find_best_seed(scores);
+            timer.stop();
+            double enrich_ms = timer.elapsed_ms();
+
+            double total_ms = inject_ms + kmer_ms + enrich_ms;
+
+            std::cout << std::setw(10) << name
+                      << std::setw(6) << k
+                      << std::setw(12) << num_seq
+                      << std::setw(10) << num_sites
+                      << std::setw(12) << std::fixed << std::setprecision(1) << size_mb
+                      << std::setw(15) << std::fixed << std::setprecision(1) << kmer_ms
+                      << std::setw(15) << std::fixed << std::setprecision(2) << enrich_ms
+                      << std::setw(15) << std::fixed << std::setprecision(1) << total_ms
+                      << std::setw(15) << best_seed
+                      << std::endl;
+        }
+    }
+    
+    total_timer.stop();
+    std::cout << std::endl;
+    std::cout << "Real data benchmark completed in " << std::fixed << std::setprecision(1) 
+              << total_timer.elapsed_sec() << " seconds" << std::endl;
+}
+
+// =============================================================================
 // Memory Estimation
 // =============================================================================
 
@@ -575,7 +725,10 @@ int main(int argc, char* argv[]) {
             << "Options:\n"
             << "  -q, --quick         Use small data sizes for fast checks\n"
             << "  --large             Use large data sizes (seconds to tens of seconds)\n"
-            << "  --n <int>            Override sequences per set\n"
+            << "  --real              Use real DNA data\n"
+            << "  --baseline <file>   Baseline FASTA file (default: data/upstream5000.fa)\n"
+            << "  --sites <file>      Binding sites file (default: data/MA0007.2.sites)\n"
+            << "  --n <int>           Override sequences per set\n"
             << "  --l <int>            Override sequence length\n"
             << "  --k <int>            Override k-mer length\n"
             << "  --runs <int>         Number of runs per configuration\n"
@@ -647,6 +800,12 @@ int main(int argc, char* argv[]) {
             quick_mode = true;
         } else if (arg == "--large") {
             large_mode = true;
+        } else if (arg == "--real") {
+            config.use_real_data = true;
+        } else if (arg == "--baseline") {
+            config.baseline_file = require_value("--baseline");
+        } else if (arg == "--sites") {
+            config.sites_file = require_value("--sites");
         } else if (arg == "--n") {
             const auto v = parse_size_t(require_value("--n"), "--n");
             config.num_sequences = {v};
@@ -654,6 +813,7 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--l") {
             const auto v = parse_size_t(require_value("--l"), "--l");
             config.seq_lengths = {v};
+            config.segment_length = v;
             override_l = true;
         } else if (arg == "--k") {
             const auto v = parse_size_t(require_value("--k"), "--k");
@@ -716,15 +876,21 @@ int main(int argc, char* argv[]) {
     
     auto total_start = high_resolution_clock::now();
     
-    // Run all benchmarks
-    benchmark_kmer_counting(config);
-    benchmark_enrichment_scoring(config);
-    benchmark_pwm_construction(config);
-    benchmark_pwm_scoring(config);
-    benchmark_sequence_masking(config);
-    benchmark_full_pipeline(config);
-    benchmark_scalability(config);
-    estimate_memory_usage(config);
+    // Run benchmarks based on mode
+    if (config.use_real_data) {
+        // Real data mode - only run real data benchmark
+        benchmark_real_data(config);
+    } else {
+        // Synthetic data mode - run all synthetic benchmarks
+        benchmark_kmer_counting(config);
+        benchmark_enrichment_scoring(config);
+        benchmark_pwm_construction(config);
+        benchmark_pwm_scoring(config);
+        benchmark_sequence_masking(config);
+        benchmark_full_pipeline(config);
+        benchmark_scalability(config);
+        estimate_memory_usage(config);
+    }
     
     auto total_end = high_resolution_clock::now();
     double total_time = duration_cast<seconds>(total_end - total_start).count();

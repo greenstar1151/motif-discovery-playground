@@ -15,5 +15,6 @@
 #include "motif/pwm_scoring.hpp"
 #include "motif/sequence_masking.hpp"
 #include "motif/data_generator.hpp"
+#include "motif/fasta_reader.hpp"
 
 #endif // MOTIF_HPP
