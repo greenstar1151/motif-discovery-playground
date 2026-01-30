@@ -73,6 +73,20 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
 endif()
 
 # -----------------------------------------------------------------------------
+# Morbius Evaluation Executable
+# -----------------------------------------------------------------------------
+add_executable(morbius_eval
+    src/morbius_eval.cpp
+)
+
+target_link_libraries(morbius_eval PRIVATE motif_core)
+
+# Enable optimizations for evaluation
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    target_compile_options(morbius_eval PRIVATE -O3 -march=native)
+endif()
+
+# -----------------------------------------------------------------------------
 # Installation
 # -----------------------------------------------------------------------------
 install(TARGETS motif_discovery DESTINATION bin)
