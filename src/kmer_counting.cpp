@@ -4,7 +4,7 @@
  */
 
 #include "motif/kmer_counting.hpp"
-#include <set>
+#include <unordered_set>
 
 namespace motif {
 
@@ -19,7 +19,8 @@ KmerCounts count_kmers(const SequenceList& sequences, size_t k) {
         }
         
         // Track k-mers seen in this sequence (ZOOPS model)
-        std::set<std::string> seen_in_seq;
+        std::unordered_set<std::string> seen_in_seq;
+        seen_in_seq.reserve(seq.length() - k + 1);
         
         // Slide window over sequence
         for (size_t i = 0; i <= seq.length() - k; ++i) {
