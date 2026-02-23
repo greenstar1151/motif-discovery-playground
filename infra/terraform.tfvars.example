@@ -1,0 +1,40 @@
+# -----------------------------------------------------------------------------
+# Terraform 변수 설정 예시
+# 이 파일을 terraform.tfvars로 복사하여 사용하세요
+# -----------------------------------------------------------------------------
+
+# AWS 리전
+aws_region = "ap-northeast-2"
+
+# 환경 (dev, staging, prod)
+environment = "dev"
+
+# 프로젝트 이름
+project_name = "motif-discovery"
+
+# EC2 인스턴스 타입
+# r5.8xlarge: 32 vCPU, 256 GB RAM (메모리 최적화)
+# c5.4xlarge: 16 vCPU, 32 GB RAM (컴퓨트 최적화)
+instance_type = "r5.8xlarge"
+
+# SSH 키 페어 이름 (AWS에 등록된 키)
+# key_name = "my-key-pair"
+
+# SSH 접속 허용 여부
+enable_ssh = true
+
+# SSH 접속 허용 CIDR (보안을 위해 본인 IP로 제한 권장)
+# 예: allowed_ssh_cidr = "123.456.789.0/32"
+allowed_ssh_cidr = "0.0.0.0/0"
+
+# S3 버킷 생성 여부
+create_s3_bucket = true
+
+# S3 버킷 이름 (비워두면 자동 생성)
+# s3_bucket_name = "my-motif-discovery-results"
+
+# 스팟 인스턴스 사용 여부 (비용 절감, 중단 가능성 있음)
+use_spot_instance = false
+
+# 스팟 인스턴스 최대 가격 (시간당 USD)
+spot_max_price = "0.10"
