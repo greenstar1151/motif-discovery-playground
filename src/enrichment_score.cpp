@@ -1,6 +1,6 @@
 /**
  * @file enrichment_score.cpp
- * @brief Implementation of Enrichment Score Calculation (Core Operation 2)
+ * @brief Implementation of enrichment-scoring helpers.
  */
 
 #include "motif/enrichment_score.hpp"
@@ -16,8 +16,11 @@ EnrichmentScores calculate_enrichment_scores(
     int neg_total
 ) {
     EnrichmentScores scores;
-    
-    // Collect all unique k-mers from both sets
+
+    if (pos_total <= 0 || neg_total <= 0) {
+        return scores;
+    }
+
     std::set<std::string> all_kmers;
     for (const auto& [kmer, _] : pos_counts) {
         all_kmers.insert(kmer);
@@ -25,31 +28,22 @@ EnrichmentScores calculate_enrichment_scores(
     for (const auto& [kmer, _] : neg_counts) {
         all_kmers.insert(kmer);
     }
-    
-    // Calculate enrichment score for each k-mer
+
+    const double inv_pos_total = 1.0 / static_cast<double>(pos_total);
+    const double inv_neg_total = 1.0 / static_cast<double>(neg_total);
+
     for (const auto& kmer : all_kmers) {
-        // Get counts (default to 0 if not present)
-        int pos_count = 0;
-        int neg_count = 0;
-        
-        auto pos_it = pos_counts.find(kmer);
-        if (pos_it != pos_counts.end()) {
-            pos_count = pos_it->second;
-        }
-        
-        auto neg_it = neg_counts.find(kmer);
-        if (neg_it != neg_counts.end()) {
-            neg_count = neg_it->second;
-        }
-        
-        // Calculate rates
-        double pos_rate = static_cast<double>(pos_count) / pos_total;
-        double neg_rate = static_cast<double>(neg_count) / neg_total;
-        
-        // Enrichment score = positive rate - negative rate
+        const auto pos_it = pos_counts.find(kmer);
+        const auto neg_it = neg_counts.find(kmer);
+
+        const int pos_count = (pos_it == pos_counts.end()) ? 0 : pos_it->second;
+        const int neg_count = (neg_it == neg_counts.end()) ? 0 : neg_it->second;
+
+        const double pos_rate = static_cast<double>(pos_count) * inv_pos_total;
+        const double neg_rate = static_cast<double>(neg_count) * inv_neg_total;
         scores[kmer] = pos_rate - neg_rate;
     }
-    
+
     return scores;
 }
 
@@ -57,43 +51,35 @@ std::pair<std::string, double> find_best_seed(const EnrichmentScores& scores) {
     if (scores.empty()) {
         return {"", 0.0};
     }
-    
-    std::string best_kmer;
-    double best_score = -1e9;  // Very negative initial value
-    
-    for (const auto& [kmer, score] : scores) {
-        if (score > best_score) {
-            best_score = score;
-            best_kmer = kmer;
-        }
-    }
-    
-    return {best_kmer, best_score};
+
+    auto best_it = std::max_element(
+        scores.begin(),
+        scores.end(),
+        [](const auto& a, const auto& b) { return a.second < b.second; }
+    );
+    return {best_it->first, best_it->second};
 }
 
 std::vector<std::pair<std::string, double>> get_top_seeds(
-    const EnrichmentScores& scores, 
+    const EnrichmentScores& scores,
     size_t n
 ) {
-    // Convert to vector for sorting
-    std::vector<std::pair<std::string, double>> sorted_scores(
-        scores.begin(), 
-        scores.end()
-    );
-    
-    // Sort by score descending
-    std::sort(sorted_scores.begin(), sorted_scores.end(),
-        [](const auto& a, const auto& b) {
-            return a.second > b.second;
+    std::vector<std::pair<std::string, double>> sorted(scores.begin(), scores.end());
+    std::sort(
+        sorted.begin(),
+        sorted.end(),
+        [](const auto& left, const auto& right) {
+            if (left.second != right.second) {
+                return left.second > right.second;
+            }
+            return left.first < right.first;
         }
     );
-    
-    // Return top N
-    if (sorted_scores.size() > n) {
-        sorted_scores.resize(n);
+
+    if (sorted.size() > n) {
+        sorted.resize(n);
     }
-    
-    return sorted_scores;
+    return sorted;
 }
 
 } // namespace motif

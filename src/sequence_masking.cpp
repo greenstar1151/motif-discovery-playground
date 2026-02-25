@@ -1,6 +1,6 @@
 /**
  * @file sequence_masking.cpp
- * @brief Implementation of Sequence Masking (Core Operation 5)
+ * @brief Implementation of sequence-masking helpers.
  */
 
 #include "motif/sequence_masking.hpp"
@@ -9,41 +9,45 @@
 namespace motif {
 
 SequenceList mask_pattern(const SequenceList& sequences, const std::string& pattern) {
+    if (pattern.empty()) {
+        return sequences;
+    }
+
     SequenceList result;
     result.reserve(sequences.size());
-    
-    std::string mask(pattern.length(), MASK_CHAR);
-    
+    const std::string mask(pattern.size(), MASK_CHAR);
+
     for (const auto& seq : sequences) {
-        std::string masked_seq = seq;
-        
-        // Replace all occurrences
+        std::string masked = seq;
         size_t pos = 0;
-        while ((pos = masked_seq.find(pattern, pos)) != std::string::npos) {
-            masked_seq.replace(pos, pattern.length(), mask);
-            pos += pattern.length();  // Move past the replacement
+        while ((pos = masked.find(pattern, pos)) != std::string::npos) {
+            masked.replace(pos, pattern.size(), mask);
+            pos += pattern.size();
         }
-        
-        result.push_back(masked_seq);
+        result.push_back(std::move(masked));
     }
-    
+
     return result;
 }
 
 int mask_pattern_inplace(SequenceList& sequences, const std::string& pattern) {
-    int total_masked = 0;
-    std::string mask(pattern.length(), MASK_CHAR);
-    
+    if (pattern.empty()) {
+        return 0;
+    }
+
+    int replaced = 0;
+    const std::string mask(pattern.size(), MASK_CHAR);
+
     for (auto& seq : sequences) {
         size_t pos = 0;
         while ((pos = seq.find(pattern, pos)) != std::string::npos) {
-            seq.replace(pos, pattern.length(), mask);
-            pos += pattern.length();
-            total_masked++;
+            seq.replace(pos, pattern.size(), mask);
+            pos += pattern.size();
+            ++replaced;
         }
     }
-    
-    return total_masked;
+
+    return replaced;
 }
 
 SequenceList mask_by_pwm(
@@ -51,64 +55,58 @@ SequenceList mask_by_pwm(
     const PWM& pwm,
     double threshold
 ) {
+    if (pwm.width == 0) {
+        return sequences;
+    }
+
     SequenceList result;
     result.reserve(sequences.size());
-    
-    std::string mask(pwm.width, MASK_CHAR);
-    
+    const std::string mask(pwm.width, MASK_CHAR);
+
     for (const auto& seq : sequences) {
-        std::string masked_seq = seq;
-        
-        if (seq.length() >= pwm.width) {
-            // Scan sequence and mask positions above threshold
-            // Process from end to start to avoid position shifting issues
-            std::vector<size_t> positions_to_mask;
-            
-            for (size_t i = 0; i <= seq.length() - pwm.width; ++i) {
-                std::string kmer = seq.substr(i, pwm.width);
-                double score = score_kmer(kmer, pwm);
-                
+        std::string masked = seq;
+
+        if (seq.size() >= pwm.width) {
+            std::vector<size_t> to_mask;
+            to_mask.reserve(seq.size() - pwm.width + 1);
+
+            for (size_t pos = 0; pos + pwm.width <= seq.size(); ++pos) {
+                const std::string window = seq.substr(pos, pwm.width);
+                const double score = score_kmer(window, pwm);
                 if (score >= threshold) {
-                    positions_to_mask.push_back(i);
+                    to_mask.push_back(pos);
                 }
             }
-            
-            // Mask from end to start
-            for (auto it = positions_to_mask.rbegin(); it != positions_to_mask.rend(); ++it) {
-                masked_seq.replace(*it, pwm.width, mask);
+
+            for (auto it = to_mask.rbegin(); it != to_mask.rend(); ++it) {
+                masked.replace(*it, pwm.width, mask);
             }
         }
-        
-        result.push_back(masked_seq);
+
+        result.push_back(std::move(masked));
     }
-    
+
     return result;
 }
 
 size_t count_masked(const Sequence& sequence) {
     size_t count = 0;
-    for (char c : sequence) {
-        if (c == MASK_CHAR) {
-            count++;
+    for (char base : sequence) {
+        if (base == MASK_CHAR) {
+            ++count;
         }
     }
     return count;
 }
 
 double masked_fraction(const SequenceList& sequences) {
-    size_t total_bases = 0;
-    size_t masked_bases = 0;
-    
+    size_t total = 0;
+    size_t masked = 0;
     for (const auto& seq : sequences) {
-        total_bases += seq.length();
-        masked_bases += count_masked(seq);
+        total += seq.size();
+        masked += count_masked(seq);
     }
-    
-    if (total_bases == 0) {
-        return 0.0;
-    }
-    
-    return static_cast<double>(masked_bases) / total_bases;
+    return (total == 0) ? 0.0 : static_cast<double>(masked) / static_cast<double>(total);
 }
 
 } // namespace motif
