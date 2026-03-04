@@ -1,259 +1,39 @@
 /**
  * @file morbius_eval.cpp
- * @brief Morbius Benchmark Evaluation - Generate result TSV for accuracy comparison
- * 
- * This tool processes a FASTA dataset and outputs motif predictions in TSV format
- * compatible with the Morbius benchmark evaluation protocol.
- * 
- * Output format (TSV):
- *   seq_id    position    motif
- *   0         859         TATATA
- *   1         729         ATATAT
- *   ...
- * 
- * Usage:
- *   ./morbius_eval <input.fasta> <output.tsv> [options]
- * 
- * Options:
- *   -k <int>              K-mer length for seed discovery (default: 16)
- *   -m <int>              Motif width for PWM scoring (default: same as k)
- *   --control <file>      Control FASTA file (default: use shuffled input)
- *   --seed <string>       Use specific seed motif instead of discovering
- *   --pwm <file>          Load PWM from JASPAR file
- *   --top <int>           Number of top seeds to try (default: 1)
- *   --help                Show this help
+ * @brief Morbius benchmark evaluator — thin CLI wrapper around motif_core.
+ *
+ * Pipeline:
+ *   1) Load input FASTA + build/load control set
+ *   2) Multi-k seed discovery with two-proportion z-test
+ *   3) HD≤1 site collection for initialisation
+ *   4) EM-style PWM refinement with Markov order-3 background LLR scoring
+ *   5) Best-site prediction per sequence → Morbius TSV output
  */
 
 #include "motif.hpp"
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <iomanip>
+
 #include <algorithm>
 #include <chrono>
-#include <random>
+#include <cmath>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace motif;
 using namespace std::chrono;
 
-// =============================================================================
-// Utilities
-// =============================================================================
+namespace {
 
-void print_usage(const char* prog) {
-    std::cerr << "\nUsage: " << prog << " <input.fasta> <output.tsv> [options]\n\n"
-              << "Options:\n"
-              << "  -k <int>              K-mer length for seed discovery (default: 16)\n"
-              << "  -m <int>              Motif width for PWM scoring (default: same as k)\n"
-              << "  --control <file>      Control FASTA file (default: use shuffled input)\n"
-              << "  --seed <string>       Use specific seed motif instead of discovering\n"
-              << "  --top <int>           Number of top seeds to try (default: 1)\n"
-              << "  --threshold <float>   PWM score threshold (default: 0.0, use best match)\n"
-              << "  --help                Show this help\n\n"
-              << "Output format (TSV):\n"
-              << "  seq_id    position    motif\n\n"
-              << "Example:\n"
-              << "  " << prog << " DATASET_DNA_3.fasta DATASET_DNA_3_result.tsv -k 16\n";
-}
-
-/**
- * @brief Shuffle a sequence preserving k-mer (default: dinucleotide) frequencies
- * 
- * Uses the Euler path method with Hierholzer's algorithm.
- * For k=2 (dinucleotide), this preserves:
- * - Single nucleotide frequencies (A, C, G, T counts)
- * - Dinucleotide frequencies (AA, AC, AG, ..., TT counts)
- * - First and last nucleotides of the sequence
- * 
- * Based on Altschul & Erickson (1985) and ushuffle algorithm.
- */
-std::string shuffle_sequence_kmer_preserving(const std::string& seq, std::mt19937& rng, size_t k = 2) {
-    if (seq.length() <= k) {
-        return seq;
-    }
-    
-    // For k=1, just do simple shuffle
-    if (k == 1) {
-        std::string shuffled = seq;
-        std::shuffle(shuffled.begin(), shuffled.end(), rng);
-        return shuffled;
-    }
-    
-    // For dinucleotide (k=2), use graph-based Euler path
-    // Vertices = (k-1)-mers, Edges = k-mers
-    const size_t prefix_len = k - 1;
-    
-    // Build adjacency list: vertex -> list of (next_char, edge_index)
-    std::map<std::string, std::vector<std::pair<char, size_t>>> adj;
-    std::vector<bool> used;
-    size_t edge_count = 0;
-    
-    for (size_t i = 0; i + k <= seq.length(); ++i) {
-        std::string vertex = seq.substr(i, prefix_len);
-        char next_char = seq[i + prefix_len];
-        adj[vertex].push_back({next_char, edge_count++});
-        used.push_back(false);
-    }
-    
-    // Shuffle adjacency lists for randomization
-    for (auto& [vertex, neighbors] : adj) {
-        std::shuffle(neighbors.begin(), neighbors.end(), rng);
-    }
-    
-    // Hierholzer's algorithm to find Euler path
-    std::string start_vertex = seq.substr(0, prefix_len);
-    std::vector<char> path_chars;
-    std::vector<std::string> stack;
-    stack.push_back(start_vertex);
-    
-    // Track current position in each adjacency list
-    std::map<std::string, size_t> adj_pos;
-    for (auto& [v, _] : adj) {
-        adj_pos[v] = 0;
-    }
-    
-    while (!stack.empty()) {
-        std::string v = stack.back();
-        
-        // Find next unused edge from v
-        bool found = false;
-        while (adj_pos.count(v) && adj_pos[v] < adj[v].size()) {
-            auto& [next_char, edge_idx] = adj[v][adj_pos[v]];
-            adj_pos[v]++;
-            
-            if (!used[edge_idx]) {
-                used[edge_idx] = true;
-                std::string next_vertex = v.substr(1) + next_char;
-                stack.push_back(next_vertex);
-                found = true;
-                break;
-            }
-        }
-        
-        if (!found) {
-            // No more edges from v, add to path
-            if (stack.size() > 1) {
-                // Extract the character that led to this vertex
-                std::string prev = stack[stack.size() - 2];
-                // The edge from prev to v determines the character
-                // v = prev[1:] + char, so char = v.back()
-                path_chars.push_back(v.back());
-            }
-            stack.pop_back();
-        }
-    }
-    
-    // Build result: start with first (k-1) chars, then add path in reverse
-    std::string result = start_vertex;
-    for (auto it = path_chars.rbegin(); it != path_chars.rend(); ++it) {
-        result += *it;
-    }
-    
-    // Verify we used all edges
-    if (result.length() != seq.length()) {
-        // Fallback to simple shuffle if Euler path failed
-        // (can happen with disconnected graph or non-Eulerian)
-        result = seq;
-        std::shuffle(result.begin(), result.end(), rng);
-    }
-    
-    return result;
-}
-
-/**
- * @brief Simple shuffle (does not preserve k-mer frequencies)
- */
-std::string shuffle_sequence_simple(const std::string& seq, std::mt19937& rng) {
-    std::string shuffled = seq;
-    std::shuffle(shuffled.begin(), shuffled.end(), rng);
-    return shuffled;
-}
-
-/**
- * @brief Generate control sequences by shuffling input sequences
- * Uses k-mer preserving shuffle (default k=2 for dinucleotide preservation)
- */
-SequenceList generate_control_sequences(const SequenceList& input, unsigned int seed, size_t k = 2) {
-    std::mt19937 rng(seed);
-    SequenceList control;
-    control.reserve(input.size());
-    
-    for (const auto& seq : input) {
-        control.push_back(shuffle_sequence_kmer_preserving(seq, rng, k));
-    }
-    
-    return control;
-}
-
-/**
- * @brief Parse JASPAR PWM file
- * Format:
- *   >MA0007.2 AR
- *   A [ count1 count2 ... ]
- *   C [ count1 count2 ... ]
- *   G [ count1 count2 ... ]
- *   T [ count1 count2 ... ]
- */
-PWM load_jaspar_pwm(const std::string& filepath) {
-    std::ifstream file(filepath);
-    if (!file.is_open()) {
-        throw std::runtime_error("Cannot open JASPAR file: " + filepath);
-    }
-    
-    PWM pwm;
-    std::string line;
-    std::array<std::vector<double>, 4> counts;
-    
-    while (std::getline(file, line)) {
-        if (line.empty() || line[0] == '>') continue;
-        
-        // Parse base line: A [ 1 2 3 4 ... ]
-        char base = line[0];
-        size_t base_idx = base_to_index(base);
-        if (base_idx == SIZE_MAX) continue;
-        
-        // Find values between [ ]
-        size_t start = line.find('[');
-        size_t end = line.find(']');
-        if (start == std::string::npos || end == std::string::npos) continue;
-        
-        std::string values = line.substr(start + 1, end - start - 1);
-        std::istringstream iss(values);
-        double val;
-        while (iss >> val) {
-            counts[base_idx].push_back(val);
-        }
-    }
-    
-    // Convert counts to probabilities
-    if (counts[0].empty()) {
-        throw std::runtime_error("Empty or invalid JASPAR file");
-    }
-    
-    pwm.width = counts[0].size();
-    if (pwm.width > MAX_MOTIF_WIDTH) {
-        throw std::runtime_error("Motif width exceeds maximum: " + std::to_string(pwm.width));
-    }
-    
-    for (size_t pos = 0; pos < pwm.width; ++pos) {
-        double total = 0;
-        for (size_t b = 0; b < 4; ++b) {
-            total += counts[b][pos];
-        }
-        
-        // Add pseudocount and normalize
-        double pseudo = 0.1;
-        for (size_t b = 0; b < 4; ++b) {
-            pwm.set(b, pos, (counts[b][pos] + pseudo) / (total + 4 * pseudo));
-        }
-    }
-    
-    return pwm;
-}
-
-// =============================================================================
-// Main Processing
-// =============================================================================
+// ─────────────────────────────────────────────────────────────────────────────
+// Configuration
+// ─────────────────────────────────────────────────────────────────────────────
 
 struct Config {
     std::string input_file;
@@ -261,134 +41,285 @@ struct Config {
     std::string control_file;
     std::string seed_motif;
     std::string jaspar_file;
+
     size_t k = 16;
-    size_t motif_width = 0;  // 0 means use k
-    size_t top_seeds = 1;
-    double threshold = 0.0;  // 0 means use best match per sequence
+    size_t motif_width = 0;
+    size_t top_seeds = 8;
+
+    double threshold = 0.0;
     unsigned int rng_seed = 42;
+
+    double z_sig = 6.0;
+    double z_sub = 3.5;
+    int em_iters = 20;
+    int em_patience = 2;
+    double em_min_improve = 1e-3;
+    size_t min_sites = 8;
+    size_t max_mstep_sites = 60000;
+    double pseudocount = 0.2;
+
+    std::string multi_k_csv;
 };
 
 struct MotifHit {
-    size_t seq_id;
-    int position;
+    size_t seq_id = 0;
+    int position = -1;
     std::string motif;
-    double score;
+    double score = -std::numeric_limits<double>::infinity();
 };
 
-/**
- * @brief Run motif discovery and generate results
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+void print_usage(const char* prog) {
+    std::cerr
+        << "\nUsage: " << prog << " <input.fasta> <output.tsv> [options]\n\n"
+        << "Options:\n"
+        << "  -k <int>              Base seed length (default: 16)\n"
+        << "  -m <int>              Motif width (default: same as k)\n"
+        << "  --control <file>      Control FASTA file (default: shuffled input)\n"
+        << "  --seed <string>       Use a fixed seed motif\n"
+        << "  --pwm <file>          Load PWM from JASPAR file\n"
+        << "  --top <int>           Number of seed candidates to refine (default: 8)\n"
+        << "  --threshold <float>   Output threshold (default: 0.0 => always best site)\n"
+        << "  --multi-k <list>      Seed widths (e.g. 10,12,14,16)\n"
+        << "  --zsig <float>        Significant z cutoff (default: 6.0)\n"
+        << "  --zsub <float>        Sub-significant z cutoff (default: 3.5)\n"
+        << "  --em-iters <int>      Max EM refinement iterations (default: 20)\n"
+        << "  --rng-seed <int>      RNG seed (default: 42)\n"
+        << "  --help                Show this help\n\n"
+        << "Output format (TSV):\n"
+        << "  seq_id    position    motif\n\n"
+        << "Example:\n"
+        << "  " << prog
+        << " DATASET_DNA_3.fasta DATASET_DNA_3_result.tsv -k 16 --top 12\n";
+}
+
+EMConfig make_em_cfg(const Config& cfg) {
+    EMConfig em;
+    em.max_iterations  = cfg.em_iters;
+    em.patience        = cfg.em_patience;
+    em.min_improvement = cfg.em_min_improve;
+    em.min_sites       = cfg.min_sites;
+    em.max_mstep_sites = cfg.max_mstep_sites;
+    em.pseudocount     = cfg.pseudocount;
+    return em;
+}
+
+std::vector<size_t> derive_k_values(const Config& cfg) {
+    if (!cfg.multi_k_csv.empty()) {
+        std::set<size_t> custom;
+        std::stringstream ss(cfg.multi_k_csv);
+        std::string token;
+
+        while (std::getline(ss, token, ',')) {
+            if (token.empty()) continue;
+            const size_t v = static_cast<size_t>(std::stoull(token));
+            if (v >= 4 && v <= MAX_MOTIF_WIDTH) {
+                custom.insert(v);
+            }
+        }
+        if (!custom.empty()) {
+            return std::vector<size_t>(custom.begin(), custom.end());
+        }
+    }
+
+    const size_t base = std::max<size_t>(4, std::min(cfg.k, MAX_MOTIF_WIDTH));
+    std::set<size_t> values;
+    values.insert(base);
+    if (base > 6)  values.insert(base - 2);
+    if (base > 8)  values.insert(base - 4);
+    if (base + 2 <= MAX_MOTIF_WIDTH) values.insert(base + 2);
+    if (cfg.motif_width > 0 && cfg.motif_width <= MAX_MOTIF_WIDTH) {
+        values.insert(cfg.motif_width);
+    }
+
+    return std::vector<size_t>(values.begin(), values.end());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Single-seed refinement
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::optional<RefinedModel> refine_from_seed(
+    const std::string& seed,
+    const SequenceList& primary,
+    const SequenceList& control,
+    const MarkovOrder3& bg,
+    const Config& cfg
+) {
+    const size_t target_width = (cfg.motif_width > 0) ? cfg.motif_width : seed.size();
+    const auto init_sites = collect_hd_sites(seed, primary, target_width, 1);
+    if (init_sites.size() < cfg.min_sites) {
+        return std::nullopt;
+    }
+
+    const PWM init_pwm = build_pwm_from_sites(init_sites, cfg.pseudocount);
+    if (init_pwm.width == 0) {
+        return std::nullopt;
+    }
+
+    return run_em_refinement(init_pwm, primary, control, bg, make_em_cfg(cfg), seed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auto-discovery: build seed pool → refine top seeds → pick best
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::optional<RefinedModel> discover_and_refine(
+    const SequenceList& primary,
+    const SequenceList& control,
+    const MarkovOrder3& bg,
+    const Config& cfg
+) {
+    const auto k_values = derive_k_values(cfg);
+    const auto pool = build_seed_pool(primary, control, k_values, cfg.z_sub);
+    if (pool.empty()) {
+        return std::nullopt;
+    }
+
+    std::optional<RefinedModel> best;
+    const size_t trials = std::min(pool.size(), std::max<size_t>(1, cfg.top_seeds));
+
+    for (size_t i = 0; i < trials; ++i) {
+        auto refined = refine_from_seed(pool[i].kmer, primary, control, bg, cfg);
+        if (!refined.has_value()) continue;
+
+        if (!best.has_value() || refined->enrichment > best->enrichment) {
+            best = refined;
+        }
+    }
+
+    // Fallback: use top seed with simple PWM if EM failed for all
+    if (!best.has_value()) {
+        const std::string fallback_seed = pool.front().kmer;
+        const PWM fallback_pwm = build_pwm_from_seed(fallback_seed, primary, cfg.pseudocount);
+        if (fallback_pwm.width == 0) return std::nullopt;
+
+        RefinedModel fallback;
+        fallback.pwm = fallback_pwm;
+        fallback.learned_threshold = 0.0;
+        fallback.enrichment = 1.0;
+        fallback.source_seed = fallback_seed;
+        return fallback;
+    }
+
+    return best;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Discovery orchestrator (3 modes: JASPAR / fixed seed / auto)
+// ─────────────────────────────────────────────────────────────────────────────
+
 std::vector<MotifHit> run_discovery(
     const FastaData& input_data,
     const SequenceList& control_seqs,
-    const Config& config
+    const Config& cfg
 ) {
-    const size_t k = config.k;
-    (void)config.motif_width;  // Reserved for future use
-    
     std::vector<MotifHit> results;
     results.reserve(input_data.sequences.size());
-    
-    // =========================================================================
-    // Step 1: Discover or use provided seed
-    // =========================================================================
-    PWM pwm;
-    std::string best_seed;
-    
-    if (!config.jaspar_file.empty()) {
-        // Load PWM from JASPAR file
-        std::cerr << "[Info] Loading PWM from JASPAR file: " << config.jaspar_file << std::endl;
-        pwm = load_jaspar_pwm(config.jaspar_file);
-        best_seed = get_consensus(pwm);
-        std::cerr << "[Info] PWM consensus: " << best_seed << " (width: " << pwm.width << ")" << std::endl;
-    } else if (!config.seed_motif.empty()) {
-        // Use provided seed
-        best_seed = config.seed_motif;
-        std::cerr << "[Info] Using provided seed: " << best_seed << std::endl;
-        pwm = build_pwm_from_seed(best_seed, input_data.sequences);
-    } else {
-        // Discover seed from k-mer enrichment
-        std::cerr << "[Info] Discovering seed with k=" << k << std::endl;
-        
-        auto pos_counts = count_kmers(input_data.sequences, k);
-        auto neg_counts = count_kmers(control_seqs, k);
-        
-        auto scores = calculate_enrichment_scores(
-            pos_counts, neg_counts,
-            static_cast<int>(input_data.sequences.size()),
-            static_cast<int>(control_seqs.size())
+
+    MarkovOrder3 bg;
+    bg.train(control_seqs);
+
+    std::optional<RefinedModel> model;
+
+    // ── Mode 1: JASPAR PWM ──────────────────────────────────────────────
+    if (!cfg.jaspar_file.empty()) {
+        std::cerr << "[Info] Loading PWM from JASPAR: " << cfg.jaspar_file << "\n";
+        const PWM loaded = load_jaspar_pwm(cfg.jaspar_file);
+        model = run_em_refinement(
+            loaded, input_data.sequences, control_seqs, bg,
+            make_em_cfg(cfg), "JASPAR"
         );
-        
-        auto top_seeds = get_top_seeds(scores, config.top_seeds);
-        
-        if (top_seeds.empty()) {
-            std::cerr << "[Error] No k-mers found!" << std::endl;
-            return results;
+        if (!model.has_value()) {
+            RefinedModel fallback;
+            fallback.pwm = loaded;
+            fallback.source_seed = get_consensus(loaded);
+            fallback.enrichment = 1.0;
+            model = fallback;
         }
-        
-        best_seed = top_seeds[0].first;
-        double best_score = top_seeds[0].second;
-        
-        std::cerr << "[Info] Top seed: " << best_seed 
-                  << " (enrichment: " << std::fixed << std::setprecision(4) << best_score << ")" << std::endl;
-        
-        if (config.top_seeds > 1 && top_seeds.size() > 1) {
-            std::cerr << "[Info] Other top seeds:" << std::endl;
-            for (size_t i = 1; i < std::min(config.top_seeds, top_seeds.size()); ++i) {
-                std::cerr << "       " << top_seeds[i].first 
-                          << " (" << std::fixed << std::setprecision(4) << top_seeds[i].second << ")" << std::endl;
+    }
+    // ── Mode 2: Fixed seed ──────────────────────────────────────────────
+    else if (!cfg.seed_motif.empty()) {
+        std::cerr << "[Info] Using fixed seed: " << cfg.seed_motif << "\n";
+        model = refine_from_seed(
+            cfg.seed_motif, input_data.sequences, control_seqs, bg, cfg
+        );
+        if (!model.has_value()) {
+            const PWM fallback_pwm = build_pwm_from_seed(
+                cfg.seed_motif, input_data.sequences, cfg.pseudocount
+            );
+            if (fallback_pwm.width > 0) {
+                RefinedModel fallback;
+                fallback.pwm = fallback_pwm;
+                fallback.source_seed = cfg.seed_motif;
+                fallback.enrichment = 1.0;
+                model = fallback;
             }
         }
-        
-        // Build PWM from seed
-        pwm = build_pwm_from_seed(best_seed, input_data.sequences);
     }
-    
-    std::cerr << "[Info] PWM consensus: " << get_consensus(pwm) << std::endl;
-    
-    // =========================================================================
-    // Step 2: Scan each sequence and find best match
-    // =========================================================================
-    std::cerr << "[Info] Scanning " << input_data.sequences.size() << " sequences..." << std::endl;
-    
+    // ── Mode 3: Auto-discovery ──────────────────────────────────────────
+    else {
+        std::cerr << "[Info] Discovering seeds with z-test (base k=" << cfg.k << ")\n";
+        model = discover_and_refine(
+            input_data.sequences, control_seqs, bg, cfg
+        );
+    }
+
+    if (!model.has_value() || model->pwm.width == 0) {
+        std::cerr << "[Error] Failed to build a valid PWM model\n";
+        return results;
+    }
+
+    // Report model
+    std::cerr << "[Info] Final seed/model: " << model->source_seed << "\n";
+    std::cerr << "[Info] Final consensus : " << get_consensus(model->pwm)
+              << " (W=" << model->pwm.width << ")\n";
+    std::cerr << "[Info] Learned enrich. : " << std::fixed << std::setprecision(3)
+              << model->enrichment << "\n";
+    std::cerr << "[Info] Learned thres.  : " << std::fixed << std::setprecision(3)
+              << model->learned_threshold << "\n";
+
+    // Scan all sequences
+    const bool force_threshold = (cfg.threshold != 0.0);
+    const double out_threshold = force_threshold ? cfg.threshold : model->learned_threshold;
+
+    std::cerr << "[Info] Scanning " << input_data.sequences.size() << " sequences...\n";
     for (size_t i = 0; i < input_data.sequences.size(); ++i) {
         const auto& seq = input_data.sequences[i];
-        
-        // Find best match position using PWM scoring
-        auto [best_pos, best_score] = find_best_match(seq, pwm);
-        
+        const MatchResult best = find_best_match_llr(seq, model->pwm, bg);
+
         MotifHit hit;
         hit.seq_id = i;
-        hit.score = best_score;
-        
-        if (best_pos >= 0 && (config.threshold == 0.0 || best_score >= config.threshold)) {
-            hit.position = best_pos;
-            // Extract the motif at the predicted position
-            if (static_cast<size_t>(best_pos) + pwm.width <= seq.length()) {
-                hit.motif = seq.substr(best_pos, pwm.width);
-            } else {
-                hit.motif = seq.substr(best_pos);
+        hit.score  = best.score;
+
+        if (best.position >= 0 && (!force_threshold || best.score >= out_threshold)) {
+            hit.position = best.position;
+            const size_t pos = static_cast<size_t>(best.position);
+            if (pos + model->pwm.width <= seq.size()) {
+                hit.motif = seq.substr(pos, model->pwm.width);
+            } else if (pos < seq.size()) {
+                hit.motif = seq.substr(pos);
             }
-        } else {
-            // No significant match found
-            hit.position = -1;
-            hit.motif = "";
         }
-        
-        results.push_back(hit);
-        
-        // Progress indicator
+
+        results.push_back(std::move(hit));
+
         if ((i + 1) % 10000 == 0) {
-            std::cerr << "[Progress] " << (i + 1) << " / " << input_data.sequences.size() << std::endl;
+            std::cerr << "[Progress] " << (i + 1) << " / "
+                      << input_data.sequences.size() << "\n";
         }
     }
-    
+
     return results;
 }
 
-/**
- * @brief Write results to TSV file
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// TSV writer
+// ─────────────────────────────────────────────────────────────────────────────
+
 void write_results_tsv(
     const std::string& filepath,
     const std::vector<MotifHit>& results,
@@ -398,172 +329,171 @@ void write_results_tsv(
     if (!out.is_open()) {
         throw std::runtime_error("Cannot open output file: " + filepath);
     }
-    
-    // Write header
+
     out << "seq_id\tposition\tmotif\n";
-    
-    // Write results
+
     for (const auto& hit : results) {
-        // Try to parse seq_id from header if available, otherwise use index
-        std::string seq_id_str;
+        std::string seq_id;
         if (hit.seq_id < headers.size()) {
-            // Use header as seq_id
-            // For Morbius format, header is just a number like "0", "1", etc.
-            // For other formats, extract the first word (before any space/tab)
-            const std::string& header = headers[hit.seq_id];
-            size_t space_pos = header.find_first_of(" \t");
-            if (space_pos != std::string::npos) {
-                seq_id_str = header.substr(0, space_pos);
-            } else {
-                seq_id_str = header;
-            }
+            const std::string& h = headers[hit.seq_id];
+            const size_t p = h.find_first_of(" \t");
+            seq_id = (p == std::string::npos) ? h : h.substr(0, p);
         } else {
-            seq_id_str = std::to_string(hit.seq_id);
+            seq_id = std::to_string(hit.seq_id);
         }
-        
+
         if (hit.position >= 0) {
-            out << seq_id_str << "\t" << hit.position << "\t" << hit.motif << "\n";
+            out << seq_id << "\t" << hit.position << "\t" << hit.motif << "\n";
         } else {
-            // No match found - output with -1 position and empty motif
-            out << seq_id_str << "\t-1\t\n";
+            out << seq_id << "\t-1\t\n";
         }
     }
-    
-    out.close();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Argument parsing
+// ─────────────────────────────────────────────────────────────────────────────
+
+Config parse_args(int argc, char* argv[]) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            std::exit(0);
+        }
+    }
+
+    if (argc < 3) {
+        print_usage(argv[0]);
+        throw std::invalid_argument("Input/output are required");
+    }
+
+    Config cfg;
+    int i = 1;
+
+    while (i < argc) {
+        const std::string arg = argv[i];
+
+        if (arg == "-k" && i + 1 < argc) {
+            cfg.k = static_cast<size_t>(std::stoull(argv[++i]));
+        } else if (arg == "-m" && i + 1 < argc) {
+            cfg.motif_width = static_cast<size_t>(std::stoull(argv[++i]));
+        } else if (arg == "--control" && i + 1 < argc) {
+            cfg.control_file = argv[++i];
+        } else if (arg == "--seed" && i + 1 < argc) {
+            cfg.seed_motif = argv[++i];
+        } else if (arg == "--pwm" && i + 1 < argc) {
+            cfg.jaspar_file = argv[++i];
+        } else if (arg == "--top" && i + 1 < argc) {
+            cfg.top_seeds = static_cast<size_t>(std::stoull(argv[++i]));
+        } else if (arg == "--threshold" && i + 1 < argc) {
+            cfg.threshold = std::stod(argv[++i]);
+        } else if (arg == "--rng-seed" && i + 1 < argc) {
+            cfg.rng_seed = static_cast<unsigned int>(std::stoi(argv[++i]));
+        } else if (arg == "--multi-k" && i + 1 < argc) {
+            cfg.multi_k_csv = argv[++i];
+        } else if (arg == "--zsig" && i + 1 < argc) {
+            cfg.z_sig = std::stod(argv[++i]);
+        } else if (arg == "--zsub" && i + 1 < argc) {
+            cfg.z_sub = std::stod(argv[++i]);
+        } else if (arg == "--em-iters" && i + 1 < argc) {
+            cfg.em_iters = std::stoi(argv[++i]);
+        } else if (cfg.input_file.empty()) {
+            cfg.input_file = arg;
+        } else if (cfg.output_file.empty()) {
+            cfg.output_file = arg;
+        } else {
+            throw std::invalid_argument("Unknown argument: " + arg);
+        }
+
+        ++i;
+    }
+
+    if (cfg.input_file.empty() || cfg.output_file.empty()) {
+        throw std::invalid_argument("Input and output files are required");
+    }
+
+    if (cfg.top_seeds == 0) cfg.top_seeds = 1;
+    if (cfg.em_iters <= 0) cfg.em_iters = 1;
+    if (cfg.z_sub > cfg.z_sig) cfg.z_sub = cfg.z_sig;
+    if (cfg.motif_width > MAX_MOTIF_WIDTH) cfg.motif_width = MAX_MOTIF_WIDTH;
+    if (cfg.k > MAX_MOTIF_WIDTH) cfg.k = MAX_MOTIF_WIDTH;
+
+    return cfg;
+}
+
+} // namespace
+
 // =============================================================================
-// Main
+// main
 // =============================================================================
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        print_usage(argv[0]);
-        return 1;
-    }
-    
-    Config config;
-    
-    // Parse arguments
-    int i = 1;
-    while (i < argc) {
-        std::string arg = argv[i];
-        
-        if (arg == "--help" || arg == "-h") {
-            print_usage(argv[0]);
-            return 0;
-        } else if (arg == "-k" && i + 1 < argc) {
-            config.k = std::stoull(argv[++i]);
-        } else if (arg == "-m" && i + 1 < argc) {
-            config.motif_width = std::stoull(argv[++i]);
-        } else if (arg == "--control" && i + 1 < argc) {
-            config.control_file = argv[++i];
-        } else if (arg == "--seed" && i + 1 < argc) {
-            config.seed_motif = argv[++i];
-        } else if (arg == "--pwm" && i + 1 < argc) {
-            config.jaspar_file = argv[++i];
-        } else if (arg == "--top" && i + 1 < argc) {
-            config.top_seeds = std::stoull(argv[++i]);
-        } else if (arg == "--threshold" && i + 1 < argc) {
-            config.threshold = std::stod(argv[++i]);
-        } else if (arg == "--rng-seed" && i + 1 < argc) {
-            config.rng_seed = static_cast<unsigned int>(std::stoi(argv[++i]));
-        } else if (config.input_file.empty()) {
-            config.input_file = arg;
-        } else if (config.output_file.empty()) {
-            config.output_file = arg;
-        } else {
-            std::cerr << "Unknown argument: " << arg << std::endl;
-            print_usage(argv[0]);
-            return 1;
-        }
-        ++i;
-    }
-    
-    if (config.input_file.empty() || config.output_file.empty()) {
-        std::cerr << "Error: Input and output files are required.\n";
-        print_usage(argv[0]);
-        return 1;
-    }
-    
     try {
-        auto start_time = high_resolution_clock::now();
-        
-        // =====================================================================
-        // Load input data
-        // =====================================================================
+        const Config cfg = parse_args(argc, argv);
+        const auto t0 = high_resolution_clock::now();
+
         std::cerr << "=========================================================\n";
-        std::cerr << "  Morbius Benchmark Evaluation - Motif Discovery\n";
+        std::cerr << "  Morbius Benchmark Evaluation (Integrated Pipeline)\n";
         std::cerr << "=========================================================\n\n";
-        
-        std::cerr << "[Info] Loading input: " << config.input_file << std::endl;
-        auto input_data = read_fasta(config.input_file);
-        std::cerr << "[Info] Loaded " << input_data.sequences.size() << " sequences" << std::endl;
-        
+
+        std::cerr << "[Info] Loading input FASTA: " << cfg.input_file << "\n";
+        const FastaData input_data = read_fasta(cfg.input_file);
         if (input_data.sequences.empty()) {
-            std::cerr << "[Error] No sequences found in input file!" << std::endl;
-            return 1;
+            throw std::runtime_error("No sequences found in input FASTA");
         }
-        
-        std::cerr << "[Info] Average sequence length: " << std::fixed << std::setprecision(1) 
-                  << input_data.avg_length() << " bp" << std::endl;
-        
-        // =====================================================================
-        // Prepare control sequences
-        // =====================================================================
-        SequenceList control_seqs;
-        
-        if (!config.control_file.empty()) {
-            std::cerr << "[Info] Loading control: " << config.control_file << std::endl;
-            auto control_data = read_fasta(config.control_file);
-            control_seqs = std::move(control_data.sequences);
-            std::cerr << "[Info] Loaded " << control_seqs.size() << " control sequences" << std::endl;
+
+        std::cerr << "[Info] Sequences loaded : " << input_data.sequences.size() << "\n";
+        std::cerr << "[Info] Avg length       : " << std::fixed << std::setprecision(1)
+                  << input_data.avg_length() << " bp\n";
+
+        SequenceList control;
+        if (!cfg.control_file.empty()) {
+            std::cerr << "[Info] Loading control FASTA: " << cfg.control_file << "\n";
+            FastaData control_data = read_fasta(cfg.control_file);
+            control = std::move(control_data.sequences);
         } else {
-            std::cerr << "[Info] Generating control sequences by shuffling..." << std::endl;
-            control_seqs = generate_control_sequences(input_data.sequences, config.rng_seed);
+            std::cerr << "[Info] Generating shuffled control (k-mer preserving, k=2)\n";
+            control = generate_control_sequences(input_data.sequences, cfg.rng_seed, 2);
         }
-        
-        // =====================================================================
-        // Run discovery
-        // =====================================================================
-        std::cerr << std::endl;
-        auto results = run_discovery(input_data, control_seqs, config);
-        
-        // =====================================================================
-        // Write results
-        // =====================================================================
-        std::cerr << std::endl;
-        std::cerr << "[Info] Writing results to: " << config.output_file << std::endl;
-        write_results_tsv(config.output_file, results, input_data.headers);
-        
-        // =====================================================================
-        // Summary
-        // =====================================================================
-        auto end_time = high_resolution_clock::now();
-        double elapsed = duration_cast<milliseconds>(end_time - start_time).count() / 1000.0;
-        
-        int hits_found = 0;
-        for (const auto& hit : results) {
-            if (hit.position >= 0) ++hits_found;
+
+        if (control.empty()) {
+            throw std::runtime_error("Control set is empty");
         }
-        
-        std::cerr << std::endl;
-        std::cerr << "=========================================================\n";
+        std::cerr << "[Info] Control sequences: " << control.size() << "\n\n";
+
+        const auto results = run_discovery(input_data, control, cfg);
+        if (results.empty()) {
+            throw std::runtime_error("No prediction results generated");
+        }
+
+        std::cerr << "\n[Info] Writing TSV: " << cfg.output_file << "\n";
+        write_results_tsv(cfg.output_file, results, input_data.headers);
+
+        int hits = 0;
+        for (const auto& r : results) {
+            if (r.position >= 0) ++hits;
+        }
+
+        const auto t1 = high_resolution_clock::now();
+        const double sec = duration_cast<milliseconds>(t1 - t0).count() / 1000.0;
+
+        std::cerr << "\n=========================================================\n";
         std::cerr << "  Summary\n";
         std::cerr << "=========================================================\n";
-        std::cerr << "  Total sequences : " << results.size() << std::endl;
-        std::cerr << "  Motifs found    : " << hits_found << std::endl;
-        std::cerr << "  Coverage        : " << std::fixed << std::setprecision(1) 
-                  << (100.0 * hits_found / results.size()) << "%" << std::endl;
-        std::cerr << "  Elapsed time    : " << std::fixed << std::setprecision(2) 
-                  << elapsed << " seconds" << std::endl;
-        std::cerr << "  Output file     : " << config.output_file << std::endl;
-        std::cerr << std::endl;
-        
+        std::cerr << "  Total sequences : " << results.size() << "\n";
+        std::cerr << "  Motifs found    : " << hits << "\n";
+        std::cerr << "  Coverage        : " << std::fixed << std::setprecision(2)
+                  << (100.0 * static_cast<double>(hits) /
+                      std::max<size_t>(1, results.size()))
+                  << "%\n";
+        std::cerr << "  Elapsed time    : " << std::fixed << std::setprecision(2)
+                  << sec << " sec\n";
+        std::cerr << "  Output file     : " << cfg.output_file << "\n\n";
+
         return 0;
-        
     } catch (const std::exception& e) {
-        std::cerr << "[Error] " << e.what() << std::endl;
+        std::cerr << "[Error] " << e.what() << "\n";
         return 1;
     }
 }
