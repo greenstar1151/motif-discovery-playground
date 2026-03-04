@@ -21,11 +21,12 @@ instance_type = "r5.8xlarge"
 # key_name = "my-key-pair"
 
 # SSH 접속 허용 여부
-enable_ssh = true
+enable_ssh = false
 
 # SSH 접속 허용 CIDR (보안을 위해 본인 IP로 제한 권장)
-# 예: allowed_ssh_cidr = "123.456.789.0/32"
-allowed_ssh_cidr = "0.0.0.0/0"
+# 예: allowed_ssh_cidr = "203.0.113.10/32"  # 본인 IP로 변경하세요
+# 주의: SSH에 대해 allowed_ssh_cidr = "0.0.0.0/0" 설정은 전체 인터넷에 공개되므로 실환경에서 사용하지 마세요.
+allowed_ssh_cidr = "203.0.113.10/32"
 
 # S3 버킷 생성 여부
 create_s3_bucket = true

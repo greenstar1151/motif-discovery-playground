@@ -23,6 +23,7 @@ Output:
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import numpy as np
@@ -45,7 +46,7 @@ def evaluate_accuracy(
     gt_df: pd.DataFrame,
     result_df: pd.DataFrame,
     tolerance: int = 0,
-    motif_length: int | None = None
+    motif_length: Optional[int] = None
 ) -> dict:
     """
     Compare predictions with ground truth.
@@ -67,24 +68,45 @@ def evaluate_accuracy(
         suffixes=('_gt', '_pred')
     )
     
-    # Count missing predictions
+    # Treat negative positions (e.g., -1 = "no match") as missing predictions
+    invalid_pred_mask = merged['position_pred'] < 0
+    merged.loc[invalid_pred_mask, 'position_pred'] = np.nan
+    
+    # Count missing predictions (including explicit "no match" values)
     missing_preds = merged['position_pred'].isna().sum()
     
-    # Filter to sequences with predictions
+    # Filter to sequences with valid predictions
     has_pred = merged['position_pred'].notna()
     matched = merged[has_pred].copy()
     
     if len(matched) == 0:
+        # No predictions available: return a full metrics dict with neutral/NaN stats
+        if motif_length is None:
+            motif_len = int(gt_df['motif'].str.len().median())
+        else:
+            motif_len = motif_length
+
         return {
             'total_sequences': len(gt_df),
             'predicted_sequences': 0,
             'missing_predictions': len(gt_df),
+            'motif_length_gt': motif_len,
+
             'exact_match': 0,
             'exact_accuracy': 0.0,
+
             'overlap_match': 0,
             'overlap_accuracy': 0.0,
+
+            'tolerance': tolerance,
             'tolerance_match': 0,
             'tolerance_accuracy': 0.0,
+
+            'mean_pos_error': float('nan'),
+            'median_pos_error': float('nan'),
+            'max_pos_error': float('nan'),
+            'min_pos_error': float('nan'),
+            'std_pos_error': float('nan'),
         }
     
     # Calculate position difference

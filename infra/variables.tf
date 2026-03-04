@@ -37,13 +37,18 @@ variable "key_name" {
 variable "enable_ssh" {
   description = "SSH 접속 허용 여부"
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "allowed_ssh_cidr" {
   description = "SSH 접속 허용 CIDR (보안을 위해 본인 IP로 제한 권장)"
   type        = string
-  default     = "0.0.0.0/0"
+  default     = ""
+
+  validation {
+    condition     = var.allowed_ssh_cidr != "0.0.0.0/0"
+    error_message = "Using 0.0.0.0/0 for allowed_ssh_cidr is not permitted. Please specify a restricted CIDR range (e.g., your IP address)."
+  }
 }
 
 # -----------------------------------------------------------------------------

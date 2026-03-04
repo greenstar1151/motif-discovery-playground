@@ -2,23 +2,7 @@
 # Data Sources
 # -----------------------------------------------------------------------------
 
-# Amazon Linux 2023 AMI (x86_64)
-data "aws_ami" "amazon_linux_2023" {
-  most_recent = true
-  owners      = ["amazon"]
-
-  filter {
-    name   = "name"
-    values = ["al2023-ami-*-x86_64"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-}
-
-# Ubuntu 22.04 LTS AMI (대안)
+# Ubuntu 22.04 LTS AMI
 data "aws_ami" "ubuntu" {
   most_recent = true
   owners      = ["099720109477"] # Canonical

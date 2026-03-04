@@ -58,7 +58,7 @@ resource "aws_security_group" "motif_discovery" {
 
   # SSH 접속 (선택적)
   dynamic "ingress" {
-    for_each = var.enable_ssh ? [1] : []
+    for_each = var.enable_ssh && var.allowed_ssh_cidr != "" ? [1] : []
     content {
       from_port   = 22
       to_port     = 22
