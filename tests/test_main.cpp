@@ -8,6 +8,7 @@
 #include "motif.hpp"
 #include <cassert>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 #include <iomanip>
 
@@ -337,6 +338,299 @@ void test_full_pipeline() {
 }
 
 // =============================================================================
+// Test 6: Markov Background Model
+// =============================================================================
+
+void test_markov_background() {
+    std::cout << "\n=== Test: Markov Background Model ===" << std::endl;
+
+    SequenceList control(20, "AAAAAA");
+    control.push_back("AAACAA");
+
+    MarkovOrder3 bg;
+    bg.train(control, 0.1);
+
+    const double p_a_given_aaa = bg.conditional_prob("AAAAAA", 3); // P(A|AAA)
+    const double p_c_given_aaa = bg.conditional_prob("AAACAA", 3); // P(C|AAA)
+
+    if (p_a_given_aaa > p_c_given_aaa) {
+        test_pass("P(A|AAA) > P(C|AAA) after training");
+    } else {
+        test_fail("Markov conditional probability ordering",
+                  "Expected P(A|AAA) > P(C|AAA)");
+    }
+
+    const double p_out_of_range = bg.conditional_prob("AAAAAA", 999);
+    if (approx_equal(p_out_of_range, 0.25)) {
+        test_pass("Out-of-range conditional_prob returns 0.25");
+    } else {
+        test_fail("Out-of-range conditional_prob",
+                  "Expected 0.25, got " + std::to_string(p_out_of_range));
+    }
+
+    const double p_invalid_base = bg.conditional_prob("AAANAA", 3);
+    if (approx_equal(p_invalid_base, 0.25)) {
+        test_pass("Invalid-base conditional_prob returns 0.25");
+    } else {
+        test_fail("Invalid-base conditional_prob",
+                  "Expected 0.25, got " + std::to_string(p_invalid_base));
+    }
+}
+
+// =============================================================================
+// Test 7: Seed Discovery Utilities
+// =============================================================================
+
+void test_seed_discovery_utils() {
+    std::cout << "\n=== Test: Seed Discovery Utilities ===" << std::endl;
+
+    {
+        const double z = z_score_two_proportion(80, 100, 10, 100);
+        if (z > 0.0) {
+            test_pass("Two-proportion z-score is positive for enriched primary");
+        } else {
+            test_fail("z_score_two_proportion", "Expected positive z-score");
+        }
+    }
+
+    {
+        const size_t hd = hamming_distance("AAAA", "AAAT");
+        if (hd == 1) {
+            test_pass("Hamming distance exact mismatch count");
+        } else {
+            test_fail("hamming_distance", "Expected 1, got " + std::to_string(hd));
+        }
+    }
+
+    {
+        const size_t hd_mismatch_len = hamming_distance("AAA", "AA");
+        if (hd_mismatch_len == std::numeric_limits<size_t>::max()) {
+            test_pass("Hamming distance returns SIZE_MAX for different lengths");
+        } else {
+            test_fail("hamming_distance length mismatch",
+                      "Expected SIZE_MAX for different lengths");
+        }
+    }
+
+    {
+        SequenceList seqs = {
+            "GGGTATATACCC",
+            "TATATAAAAAAA",
+            "CCCCCCCCCCCC"
+        };
+
+        const auto sites = collect_hd_sites("TATATA", seqs, 6, 1);
+        if (sites.size() == 2) {
+            test_pass("collect_hd_sites returns expected number of matches");
+        } else {
+            test_fail("collect_hd_sites count",
+                      "Expected 2, got " + std::to_string(sites.size()));
+        }
+
+        const auto wide_sites = collect_hd_sites("TATATA", {"CCCTATATAGGG"}, 8, 1);
+        if (wide_sites.size() == 1 && wide_sites[0].size() == 8) {
+            test_pass("collect_hd_sites target_width expansion works");
+        } else {
+            test_fail("collect_hd_sites target_width",
+                      "Expected exactly one width-8 site");
+        }
+    }
+
+    {
+        SequenceList primary(40, "GGGTATATACCC");
+        SequenceList control(40, "GGGCGCGCGCCC");
+
+        const auto pool = build_seed_pool(primary, control, {6}, 1.0, 10);
+        const bool has_seed = std::any_of(
+            pool.begin(), pool.end(),
+            [](const SeedCandidate& c) { return c.kmer == "TATATA"; }
+        );
+
+        if (!pool.empty() && has_seed) {
+            test_pass("build_seed_pool includes enriched motif candidate");
+        } else {
+            test_fail("build_seed_pool",
+                      "Expected non-empty pool containing TATATA");
+        }
+    }
+}
+
+// =============================================================================
+// Test 8: EM Refinement + Mask Utilities
+// =============================================================================
+
+void test_em_refinement_and_masking() {
+    std::cout << "\n=== Test: EM Refinement + Mask Utilities ===" << std::endl;
+
+    {
+        SequenceList seqs = {"ACGTACGT"};
+        MaskMatrix mask = init_mask(seqs);
+        mark_window(mask[0], 2, 3);
+
+        const SequenceList masked = apply_mask(seqs, mask);
+        const double frac = masked_fraction(mask);
+
+        if (masked[0] == "ACNNNCGT") {
+            test_pass("apply_mask respects marked window");
+        } else {
+            test_fail("apply_mask", "Expected ACNNNCGT, got " + masked[0]);
+        }
+
+        if (window_is_masked(mask[0], 2, 3) && approx_equal(frac, 3.0 / 8.0)) {
+            test_pass("window_is_masked and masked_fraction are consistent");
+        } else {
+            test_fail("Mask utility consistency", "Unexpected mask window/fraction behavior");
+        }
+    }
+
+    DataGenerator gen(7);
+    auto [primary, control] = gen.generate_test_data(300, 60, "TATATA", 0.6);
+
+    MarkovOrder3 bg;
+    bg.train(control);
+
+    const auto init_sites = collect_hd_sites("TATATA", primary, 6, 1);
+    if (init_sites.size() < 8) {
+        test_fail("EM init sites", "Too few initialization sites for EM");
+        return;
+    }
+
+    const PWM init_pwm = build_pwm_from_sites(init_sites, 0.2);
+    EMConfig cfg;
+    cfg.max_iterations = 8;
+    cfg.patience = 2;
+    cfg.min_improvement = 1e-3;
+    cfg.min_sites = 8;
+    cfg.max_mstep_sites = 20000;
+    cfg.pseudocount = 0.2;
+
+    const auto refined = run_em_refinement(init_pwm, primary, control, bg, cfg, "TATATA");
+    if (refined.has_value() && refined->pwm.width == 6 && refined->enrichment > 1.0) {
+        test_pass("run_em_refinement (no mask) produces enriched model");
+    } else {
+        test_fail("run_em_refinement (no mask)", "Expected valid enriched refined model");
+    }
+
+    const PWM motif_pwm = build_pwm_from_sites(std::vector<std::string>(30, "TATATA"), 0.1);
+    const MatchResult best = find_best_match_llr("GGGTATATAGGG", motif_pwm, bg);
+    if (best.position >= 0 && std::isfinite(best.score)) {
+        test_pass("find_best_match_llr returns finite best match");
+    } else {
+        test_fail("find_best_match_llr", "Expected finite match with valid position");
+    }
+
+    MaskRow full_mask(12, 1);
+    const MatchResult masked_best = find_best_match_llr("GGGTATATAGGG", full_mask, motif_pwm, bg);
+    if (masked_best.position == -1) {
+        test_pass("find_best_match_llr (masked) skips fully masked sequence");
+    } else {
+        test_fail("find_best_match_llr (masked)", "Expected no valid position under full mask");
+    }
+
+    MaskMatrix pmask = init_mask(primary);
+    MaskMatrix cmask = init_mask(control);
+    const auto refined_masked = run_em_refinement(
+        init_pwm, primary, control, pmask, cmask, bg, cfg, "TATATA"
+    );
+
+    if (refined_masked.has_value() && refined_masked->enrichment > 1.0) {
+        test_pass("run_em_refinement (with mask) produces enriched model");
+    } else {
+        test_fail("run_em_refinement (with mask)", "Expected valid enriched refined model");
+    }
+
+    if (refined.has_value()) {
+        const int erased = erase_by_pwm(
+            primary, pmask, refined->pwm, bg, refined->learned_threshold
+        );
+        if (erased > 0 && masked_fraction(pmask) > 0.0) {
+            test_pass("erase_by_pwm masks at least one hit window");
+        } else {
+            test_fail("erase_by_pwm", "Expected erased > 0 and non-zero masked fraction");
+        }
+    }
+}
+
+// =============================================================================
+// Test 9: IO Utilities
+// =============================================================================
+
+void test_io_utils() {
+    std::cout << "\n=== Test: IO Utilities ===" << std::endl;
+
+    {
+        const std::string seq = "ACGTACGTACGT";
+        std::mt19937 rng(123);
+        const std::string shuffled = shuffle_sequence_kmer_preserving(seq, rng, 2);
+
+        const KmerCounts original_di = count_kmers_total({seq}, 2);
+        const KmerCounts shuffled_di = count_kmers_total({shuffled}, 2);
+
+        if (shuffled.size() == seq.size()) {
+            test_pass("k-mer preserving shuffle keeps sequence length");
+        } else {
+            test_fail("shuffle length", "Expected same sequence length after shuffle");
+        }
+
+        if (original_di == shuffled_di) {
+            test_pass("Dinucleotide counts preserved after k=2 shuffle");
+        } else {
+            test_fail("k-mer preserving shuffle", "Dinucleotide composition changed");
+        }
+    }
+
+    {
+        SequenceList input = {"ACGTACGT", "TATATATA"};
+        const auto control_a = generate_control_sequences(input, 42, 2);
+        const auto control_b = generate_control_sequences(input, 42, 2);
+
+        if (control_a == control_b) {
+            test_pass("generate_control_sequences is deterministic for fixed seed");
+        } else {
+            test_fail("generate_control_sequences determinism",
+                      "Expected same output with same seed");
+        }
+    }
+
+    {
+        std::string jaspar_path = "data/MA0007.2.jaspar";
+        std::ifstream f(jaspar_path);
+        if (!f.is_open()) {
+            jaspar_path = "../data/MA0007.2.jaspar";
+            f.clear();
+            f.open(jaspar_path);
+        }
+
+        if (!f.is_open()) {
+            test_fail("load_jaspar_pwm", "Could not locate MA0007.2.jaspar test file");
+        } else {
+            try {
+                const PWM pwm = load_jaspar_pwm(jaspar_path);
+                bool valid = (pwm.width > 0);
+                for (size_t pos = 0; pos < pwm.width && valid; ++pos) {
+                    double col_sum = 0.0;
+                    for (size_t b = 0; b < ALPHABET_SIZE; ++b) {
+                        col_sum += pwm.at(b, pos);
+                    }
+                    if (!approx_equal(col_sum, 1.0, 1e-4)) {
+                        valid = false;
+                    }
+                }
+
+                if (valid) {
+                    test_pass("load_jaspar_pwm loads normalized PWM");
+                } else {
+                    test_fail("load_jaspar_pwm normalization",
+                              "Loaded PWM has invalid width or non-normalized columns");
+                }
+            } catch (const std::exception& e) {
+                test_fail("load_jaspar_pwm exception", e.what());
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -351,6 +645,10 @@ int main() {
     test_pwm_scoring();
     test_sequence_masking();
     test_full_pipeline();
+    test_markov_background();
+    test_seed_discovery_utils();
+    test_em_refinement_and_masking();
+    test_io_utils();
     
     std::cout << "\n=============================================" << std::endl;
     std::cout << "  Results: " << tests_passed << " passed, " 
