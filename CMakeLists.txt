@@ -33,6 +33,10 @@ add_library(motif_core STATIC
     src/pwm_scoring.cpp
     src/sequence_masking.cpp
     src/data_generator.cpp
+    src/markov.cpp
+    src/seed_discovery.cpp
+    src/em_refinement.cpp
+    src/io_utils.cpp
 )
 
 target_include_directories(motif_core PUBLIC
