@@ -67,9 +67,58 @@ add_executable(motif_benchmark
 
 target_link_libraries(motif_benchmark PRIVATE motif_core)
 
-# Enable optimizations for benchmark
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    target_compile_options(motif_benchmark PRIVATE -O3 -march=native)
+# -----------------------------------------------------------------------------
+# Morbius Evaluation Executable
+# -----------------------------------------------------------------------------
+add_executable(morbius_eval
+    src/morbius_eval.cpp
+)
+
+target_link_libraries(morbius_eval PRIVATE motif_core)
+
+# -----------------------------------------------------------------------------
+# Aggressive Optimizations for Release Build
+# -----------------------------------------------------------------------------
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        # Core library optimizations
+        target_compile_options(motif_core PRIVATE
+            -O3
+            -march=native
+            -mtune=native
+            -funroll-loops
+            -fomit-frame-pointer
+            -ffast-math
+            -flto
+        )
+        target_compile_definitions(motif_core PRIVATE NDEBUG)
+        
+        # Benchmark optimizations
+        target_compile_options(motif_benchmark PRIVATE
+            -O3
+            -march=native
+            -mtune=native
+            -funroll-loops
+            -fomit-frame-pointer
+            -ffast-math
+            -flto
+        )
+        target_link_options(motif_benchmark PRIVATE -flto)
+        target_compile_definitions(motif_benchmark PRIVATE NDEBUG)
+        
+        # Morbius eval optimizations
+        target_compile_options(morbius_eval PRIVATE
+            -O3
+            -march=native
+            -mtune=native
+            -funroll-loops
+            -fomit-frame-pointer
+            -ffast-math
+            -flto
+        )
+        target_link_options(morbius_eval PRIVATE -flto)
+        target_compile_definitions(morbius_eval PRIVATE NDEBUG)
+    endif()
 endif()
 
 # -----------------------------------------------------------------------------

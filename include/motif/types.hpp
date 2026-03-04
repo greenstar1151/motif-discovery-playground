@@ -10,6 +10,7 @@
 #define MOTIF_TYPES_HPP
 
 #include <array>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>

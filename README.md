@@ -211,3 +211,91 @@ auto control = sample_sequences(chopped, 32768, /*seed=*/1000);
 auto comp = compute_base_composition(primary);
 std::cout << "GC content: " << (comp.gc_content() * 100) << "%\n";
 ```
+
+## Morbius Benchmark Evaluation
+
+This library includes tools for comparing motif discovery accuracy with the Morbius benchmark (IEEE e-Science 2024).
+
+### Generating Result TSV
+
+The `morbius_eval` tool processes FASTA datasets and outputs predictions in TSV format compatible with Morbius ground truth files.
+
+```bash
+# Basic usage
+./build/morbius_eval DATASET_DNA_3.fasta DATASET_DNA_3_result.tsv
+
+# Specify k-mer length
+./build/morbius_eval DATASET_DNA_3.fasta DATASET_DNA_3_result.tsv -k 6
+
+# Use specific seed motif
+./build/morbius_eval DATASET_DNA_3.fasta DATASET_DNA_3_result.tsv --seed AGAACA
+
+# Use control sequences instead of shuffling
+./build/morbius_eval DATASET_DNA_3.fasta result.tsv --control control.fasta
+
+# Show top N candidate seeds
+./build/morbius_eval DATASET_DNA_3.fasta result.tsv --top 5
+```
+
+**Output format (TSV):**
+```
+seq_id	position	motif
+0	859	TATATA
+1	729	AGAACA
+2	145	TGTACA
+...
+```
+
+### Evaluating Accuracy
+
+Compare predictions with ground truth using the Python evaluation script:
+
+```bash
+# Install dependencies
+pip install pandas numpy
+
+# Basic accuracy evaluation
+python scripts/evaluate_accuracy.py DATASET_DNA_3_gt.tsv DATASET_DNA_3_result.tsv
+
+# With position tolerance (±10bp)
+python scripts/evaluate_accuracy.py DATASET_DNA_3_gt.tsv result.tsv --tolerance 10
+
+# Save detailed per-sequence comparison
+python scripts/evaluate_accuracy.py DATASET_DNA_3_gt.tsv result.tsv --output detailed.csv
+
+# Output as JSON
+python scripts/evaluate_accuracy.py DATASET_DNA_3_gt.tsv result.tsv --json
+```
+
+**Accuracy Metrics:**
+- **Exact match**: Predicted position exactly matches GT position
+- **Overlap match**: Predicted motif overlaps with GT motif region
+- **Tolerance match**: Position within ±N bp of GT
+
+**Example output:**
+```
+============================================================
+  Morbius Benchmark Accuracy Evaluation
+============================================================
+
+[Dataset Statistics]
+  Total sequences      : 131,072
+  Predicted sequences  : 131,072
+  Missing predictions  : 0
+  GT motif length      : 115 bp
+
+[Accuracy Metrics]
+  Exact match          : 12,345 / 131,072
+                       : 9.42%
+
+  Overlap match        : 98,765 / 131,072
+  (within GT region)   : 75.35%
+
+[Position Error Statistics]
+  Mean error           : 42.15 bp
+  Median error         : 28.00 bp
+  Std dev              : 35.67 bp
+  Min / Max            : 0 / 884 bp
+
+============================================================
+```
